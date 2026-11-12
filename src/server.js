@@ -21,13 +21,15 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import {
-  mutate, read, ago, norm, overlaps, logEvent, nextId, taskId, ensureDirs,
+  mutate, read, ago, norm, overlaps, logEvent, nextId, taskId, ensureDirs, outPath, errPath,
 } from "./store.js";
 import { isAlive, killTree } from "./proc.js";
 import { loadBackends, spawnBackend, recoverTask } from "./backends.js";
 import { briefingFor } from "./briefing.js";
 import { classifyFailure, localUsage, isExhausted, isExpired, untilReset } from "./limits.js";
 import { writeBrainNote, readBrainNote, searchBrain, brainPreview } from "./brain.js";
+import { registerGithubTools } from "./githubTools.js";
+import { assertCwdAllowed, resolveLockKey, logicalKeysOverlap } from "./security.js";
 
 /**
  * Every delegation target, loaded from the registry (built-in presets plus
@@ -350,6 +352,10 @@ async function reap(id) {
       task.conversationId = payload.conversation_id || task.conversationId;
       task.usage = payload.usage;
       task.durationSeconds = payload.duration_seconds;
+      task.finished_at = Date.now();
+      task.workflow_state = task.status === "done"
+        ? (task.mode === "plan" ? "waiting_for_approval" : "completed")
+        : "failed";
       task.updated = Date.now();
       releaseTaskLocks(b, id);
       settlePresence(b, task.owner, id);
@@ -377,6 +383,8 @@ async function reap(id) {
         markLimited(b, task.owner, why);
       }
       task.updated = Date.now();
+      task.finished_at = Date.now();
+      task.workflow_state = "failed";
       releaseTaskLocks(b, id);
       settlePresence(b, task.owner, id);
       logEvent(b, AGENT, "task.failed", `${id} ${task.title}`);
@@ -474,16 +482,45 @@ export function pickFailover(board, exclude = []) {
   return usable.find((s) => s.verified) || usable[0] || null;
 }
 
+function findLockConflicts(locks, actorOwner, lockCandidates) {
+  return locks
+    .filter(
+      (l) =>
+        l.owner !== actorOwner &&
+        lockCandidates.some(
+          (c) => overlaps(c.absPath, l.path) || logicalKeysOverlap(c.logicalKey, l.logicalKey)
+        )
+    )
+    .map((l) => ({
+      path: l.path,
+      ...(l.logicalKey ? { logical_key: l.logicalKey } : {}),
+      held_by: l.owner,
+    }));
+}
+
 /**
  * Shared core of every `*_delegate` tool: validate cwd + bin, check for path
  * conflicts, spawn, and record the task + locks + presence on the board.
  */
 async function delegateTask({
   owner, toolPrefix, specId, id, briefing, cwd, spawnExtra, claim, findBin, spawn, title, prompt,
-  failover = true, triedOwners = [],
+  failover = true, triedOwners = [], meta = {},
 }) {
   if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
     return { error: `cwd is not a directory: ${cwd}` };
+  }
+  try {
+    assertCwdAllowed(cwd);
+  } catch (e) {
+    return { error: e.message };
+  }
+  if (specId === "claude" && spawnExtra?.mode === "execute" && spawnExtra?.approvalConfirmed !== true) {
+    return {
+      task_id: id,
+      status: "waiting_for_approval",
+      cwd,
+      error: "Execution mode requires approval_confirmed=true after explicit user approval of the plan.",
+    };
   }
   try {
     findBin();
@@ -521,7 +558,7 @@ async function delegateTask({
         // model was chosen for the ORIGINAL backend and rarely names anything
         // the replacement understands, so it is dropped rather than passed on.
         spawnExtra: { ...spawnExtra, model: undefined },
-        failover, triedOwners: tried,
+        failover, triedOwners: tried, meta,
       });
       if (!out.error) {
         await mutate((b) => logEvent(b, AGENT, "task.failover", `${owner} unavailable -> ${alt.prefix} (${id})`));
@@ -548,9 +585,8 @@ async function delegateTask({
   // mutate() below, under the board lock, closing the race where two
   // *_delegate calls for an overlapping path both pass this check before
   // either has recorded its lock (same pattern claim_paths already uses).
-  const conflicts = read().locks
-    .filter((l) => l.owner !== owner && claim.some((c) => overlaps(c, l.path)))
-    .map((l) => ({ path: l.path, held_by: l.owner }));
+  const lockCandidates = claim.map((c) => resolveLockKey(c));
+  const conflicts = findLockConflicts(read().locks, owner, lockCandidates);
   if (conflicts.length) return { error: "path conflict; resolve before delegating", conflicts };
 
   let pid;
@@ -562,9 +598,7 @@ async function delegateTask({
 
   const raceLoss = await mutate((b) => {
     const now = Date.now();
-    const raceConflicts = b.locks
-      .filter((l) => l.owner !== owner && claim.some((c) => overlaps(c, l.path)))
-      .map((l) => ({ path: l.path, held_by: l.owner }));
+    const raceConflicts = findLockConflicts(b.locks, owner, lockCandidates);
     if (raceConflicts.length) return raceConflicts;
 
     b.tasks.push({
@@ -578,10 +612,20 @@ async function delegateTask({
       // and without them a reassignment can't reserve what the original held.
       ...(claim.length && { claim }),
       status: "running", cwd, kind: "delegated", pid, created: now, updated: now,
+      started_at: now, output_path: outPath(id), error_path: errPath(id),
+      ...(meta.project_id ? { project_id: meta.project_id } : {}),
+      ...(meta.repository ? { repository: meta.repository } : {}),
+      ...(meta.branch ? { branch: meta.branch } : {}),
+      ...(meta.base_sha ? { base_sha: meta.base_sha } : {}),
+      ...(spawnExtra?.mode ? { mode: spawnExtra.mode } : {}),
     });
-    for (const p of claim) {
-      b.locks = b.locks.filter((l) => l.path !== p);
-      b.locks.push({ path: p, owner, taskId: id, note: title, created: now });
+    for (const c of lockCandidates) {
+      b.locks = b.locks.filter((l) => l.path !== c.absPath);
+      b.locks.push({
+        path: c.absPath,
+        ...(c.logicalKey ? { logicalKey: c.logicalKey } : {}),
+        owner, taskId: id, note: title, created: now,
+      });
     }
     // Spread, for the same reason settlePresence() does: if this delegate runs
     // its own copy of this server, model/pid/cwd are facts it reported about
@@ -607,7 +651,7 @@ async function delegateTask({
 }
 
 
-async function followupTask({ owner, task_id, prompt, spawn, buildExtra }) {
+async function followupTask({ owner, specId, task_id, prompt, spawn, buildExtra, extraOpts = {} }) {
   const parent = await reap(task_id);
   // Same distinction as task_reassign: a failed task carries its stderr in
   // `.error`, so only a missing-task envelope (no id) is a lookup failure.
@@ -628,10 +672,24 @@ async function followupTask({ owner, task_id, prompt, spawn, buildExtra }) {
   if (!parent.conversationId) {
     return { error: `task ${task_id} has no conversation_id (status=${parent.status})` };
   }
+  try {
+    assertCwdAllowed(parent.cwd);
+  } catch (e) {
+    return { error: e.message };
+  }
+  const effectiveMode = extraOpts?.mode ?? parent.mode;
+  if (specId === "claude" && effectiveMode === "execute" && extraOpts?.approvalConfirmed !== true) {
+    return {
+      task_id: parent.id,
+      status: "waiting_for_approval",
+      cwd: parent.cwd,
+      error: "Execution mode requires approval_confirmed=true after explicit user approval of the plan.",
+    };
+  }
   const id = taskId();
   let pid;
   try {
-    pid = spawn(id, prompt, { cwd: parent.cwd, ...buildExtra(parent.conversationId) });
+    pid = spawn(id, prompt, { cwd: parent.cwd, ...buildExtra(parent.conversationId, parent) });
   } catch (e) {
     return { error: `failed to launch ${owner}: ${e.message}` };
   }
@@ -644,6 +702,12 @@ async function followupTask({ owner, task_id, prompt, spawn, buildExtra }) {
       // A follow-up continues the same conversation/session, so it's the
       // same model even though nothing about model choice is re-specified.
       conversationId: parent.conversationId, model: parent.model ?? null, pid, created: now, updated: now,
+      started_at: now, output_path: outPath(id), error_path: errPath(id),
+      ...(parent.project_id ? { project_id: parent.project_id } : {}),
+      ...(parent.repository ? { repository: parent.repository } : {}),
+      ...(parent.branch ? { branch: parent.branch } : {}),
+      ...(parent.base_sha ? { base_sha: parent.base_sha } : {}),
+      ...(effectiveMode ? { mode: effectiveMode } : {}),
     });
     // A follow-up is real work by that agent, same as the original delegation
     // -- without this it runs while the board still shows the agent idle, and
@@ -705,6 +769,10 @@ function registerDelegationTools(server, spec) {
         claim: z.array(z.string()).optional().describe("Paths it will own"),
         auto_approve: z.boolean().optional(),
         failover: z.boolean().optional().describe("Default true; false = fail instead of rerouting"),
+        project_id: z.string().optional().describe("Optional project id from registry"),
+        repository: z.string().optional().describe("Optional repository slug"),
+        branch: z.string().optional().describe("Optional working branch"),
+        base_sha: z.string().optional().describe("Optional base commit SHA"),
         // Only offered where the CLI actually has the flag -- advertising an
         // option the backend ignores is worse than not offering it.
         ...(spec.id === "ag" && {
@@ -715,11 +783,21 @@ function registerDelegationTools(server, spec) {
         ...(spec.id === "copilot" && {
           effort: z.enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"]).optional(),
         }),
+        ...(spec.id === "claude" && {
+          mode: z.enum(["plan", "execute"]).optional().describe("plan (default read-only) or execute (requires approval_confirmed=true)"),
+          approval_confirmed: z.boolean().optional().describe("Must be true before execute mode can spawn"),
+          permission_mode: z.enum(["plan", "acceptEdits", "default", "dontAsk", "auto"]).optional(),
+          allowed_tools: z.array(z.string()).optional(),
+          disallowed_tools: z.array(z.string()).optional(),
+          tools: z.array(z.string()).optional(),
+          effort: z.enum(["low", "medium", "high", "max"]).optional(),
+          max_budget_usd: z.number().positive().optional(),
+        }),
       },
     },
     async (a) => {
       const cwd = path.resolve(a.cwd);
-      const claim = (a.claim || []).map(norm);
+      const claim = (a.claim || []).map((p) => norm(path.isAbsolute(p) ? p : path.resolve(cwd, p)));
       const id = taskId();
       return ok(
         await delegateTask({
@@ -729,8 +807,20 @@ function registerDelegationTools(server, spec) {
           spawn: (taskId_, briefing, extra) => spawnBackend(spec, taskId_, briefing, extra),
           spawnExtra: {
             model: a.model, mode: a.mode, effort: a.effort,
-            addDirs: a.add_dirs || [], autoApprove: a.auto_approve ?? true,
+            addDirs: a.add_dirs || [], autoApprove: a.auto_approve ?? false,
             timeoutSeconds: a.timeout_seconds,
+            approvalConfirmed: a.approval_confirmed,
+            permissionMode: a.permission_mode,
+            allowedTools: a.allowed_tools,
+            disallowedTools: a.disallowed_tools,
+            tools: a.tools,
+            maxBudgetUsd: a.max_budget_usd,
+          },
+          meta: {
+            project_id: a.project_id,
+            repository: a.repository,
+            branch: a.branch,
+            base_sha: a.base_sha,
           },
           failover: a.failover ?? true,
         })
@@ -746,14 +836,44 @@ function registerDelegationTools(server, spec) {
         description:
           `Follow up in the SAME ${label} session as a finished task, keeping its context. ` +
           `Use instead of ${toolPrefix}_delegate whenever the request builds on work it just did.`,
-        inputSchema: { task_id: z.string(), prompt: z.string() },
+        inputSchema: {
+          task_id: z.string(),
+          prompt: z.string(),
+          ...(spec.id === "claude" && {
+            mode: z.enum(["plan", "execute"]).optional(),
+            approval_confirmed: z.boolean().optional(),
+            permission_mode: z.enum(["plan", "acceptEdits", "default", "dontAsk", "auto"]).optional(),
+            allowed_tools: z.array(z.string()).optional(),
+            disallowed_tools: z.array(z.string()).optional(),
+            tools: z.array(z.string()).optional(),
+            effort: z.enum(["low", "medium", "high", "max"]).optional(),
+            max_budget_usd: z.number().positive().optional(),
+          }),
+        },
       },
-      async ({ task_id, prompt }) =>
+      async (a) =>
         ok(
           await followupTask({
-            owner: spec.owner, task_id, prompt,
+            owner: spec.owner,
+            specId: spec.id,
+            task_id: a.task_id,
+            prompt: a.prompt,
             spawn: (taskId_, p, extra) => spawnBackend(spec, taskId_, p, extra),
-            buildExtra: (conversationId) => ({ resume: conversationId }),
+            extraOpts: {
+              mode: a.mode,
+              approvalConfirmed: a.approval_confirmed,
+            },
+            buildExtra: (conversationId, parent) => ({
+              resume: conversationId,
+              autoApprove: false,
+              mode: a.mode ?? parent.mode,
+              permissionMode: a.permission_mode,
+              allowedTools: a.allowed_tools,
+              disallowedTools: a.disallowed_tools,
+              tools: a.tools,
+              effort: a.effort,
+              maxBudgetUsd: a.max_budget_usd,
+            }),
           })
         )
     );
@@ -1006,6 +1126,7 @@ export async function buildServer() {
   for (const spec of BACKENDS_LIST) {
     registerDelegationTools(server, spec);
   }
+  registerGithubTools(server, { agentName: () => AGENT });
 
   server.registerTool(
     "task_reassign",
@@ -1120,7 +1241,11 @@ export async function buildServer() {
         "own items current here so the other agent is not guessing.",
       inputSchema: {
         task_id: z.string(),
-        status: z.enum(["open", "running", "blocked", "done", "failed", "cancelled"]).optional(),
+        status: z.enum([
+          "open", "queued", "planning", "waiting_for_approval",
+          "running", "testing", "completed", "done",
+          "failed", "cancelled", "pushed", "blocked",
+        ]).optional(),
         note: z.string().optional(),
         owner: z.string().optional(),
       },
@@ -1155,7 +1280,7 @@ export async function buildServer() {
       await touchPresence();
       let items = read().tasks;
       if (owner) items = items.filter((t) => t.owner === owner);
-      if (!include_done) items = items.filter((t) => !["done", "cancelled", "failed"].includes(t.status));
+      if (!include_done) items = items.filter((t) => !["done", "completed", "cancelled", "failed", "pushed"].includes(t.status));
       items = items.slice(-Math.max(1, limit)).map((t) => ({
         id: t.id, title: t.title, owner: t.owner, assigned_by: t.assignedBy,
         status: t.status, kind: t.kind, cwd: t.cwd, age: ago(t.created),
@@ -1183,13 +1308,25 @@ export async function buildServer() {
       const out = await mutate((b) => {
         const granted = [], conflicts = [];
         for (const raw of paths) {
-          const p = norm(raw);
-          const clash = b.locks.find((l) => l.owner !== AGENT && overlaps(p, l.path));
+          const info = resolveLockKey(raw);
+          const p = info.absPath;
+          const clash = b.locks.find(
+            (l) => l.owner !== AGENT && (overlaps(p, l.path) || logicalKeysOverlap(info.logicalKey, l.logicalKey))
+          );
           if (clash) {
-            conflicts.push({ path: p, held_by: clash.owner, their_note: clash.note });
+            conflicts.push({
+              path: p,
+              ...(info.logicalKey ? { logical_key: info.logicalKey } : {}),
+              held_by: clash.owner,
+              their_note: clash.note,
+            });
           } else {
             b.locks = b.locks.filter((l) => l.path !== p);
-            b.locks.push({ path: p, owner: AGENT, taskId: task_id, note, created: Date.now() });
+            b.locks.push({
+              path: p,
+              ...(info.logicalKey ? { logicalKey: info.logicalKey } : {}),
+              owner: AGENT, taskId: task_id, note, created: Date.now(),
+            });
             granted.push(p);
           }
         }
@@ -1253,10 +1390,14 @@ export async function buildServer() {
       return ok({
         you_are: AGENT,
         paths: paths.map((raw) => {
-          const p = norm(raw);
-          const holder = locks.find((l) => overlaps(p, l.path));
+          const info = resolveLockKey(raw);
+          const p = info.absPath;
+          const holder = locks.find(
+            (l) => overlaps(p, l.path) || logicalKeysOverlap(info.logicalKey, l.logicalKey)
+          );
           return {
             path: p,
+            ...(info.logicalKey ? { logical_key: info.logicalKey } : {}),
             free: !holder || holder.owner === AGENT,
             held_by: holder ? holder.owner : null,
             note: holder ? holder.note : "",

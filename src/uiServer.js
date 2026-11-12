@@ -85,7 +85,10 @@ function serveStatic(req, res) {
   });
 }
 
-export function startUiServer({ port = DEFAULT_UI_PORT } = {}) {
+export function startUiServer({
+  port = DEFAULT_UI_PORT,
+  host = process.env.ANTIGRAVITY_UI_HOST || "127.0.0.1",
+} = {}) {
   if (!fs.existsSync(UI_DIST)) {
     throw new Error(
       `UI build not found at ${UI_DIST}. This is a packaging problem -- ui-dist/ should ship with ` +
@@ -146,7 +149,7 @@ export function startUiServer({ port = DEFAULT_UI_PORT } = {}) {
 
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, () => {
+    server.listen(port, host, () => {
       server.off("error", reject);
       try {
         ensureDirs();

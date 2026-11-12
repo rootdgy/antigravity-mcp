@@ -22,6 +22,8 @@
     "deinit": "node src/cli.js deinit",
     "ui": "node src/cli.js ui",
     "test": "node test/smoke.js",
+    "test:units": "node test/units.js",
+    "test:github": "node test/github-tools.js",
     "ui:build": "cd ui && npm install && npm run build",
     "prepare": "node -e \"if(!require('fs').existsSync('ui-dist/index.html'))require('child_process').execSync('npm run ui:build',{stdio:'inherit'})\"",
     "prepublishOnly": "npm run ui:build"

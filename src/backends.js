@@ -55,8 +55,34 @@ export function recoverTask(id) {
   return at === -1 ? brief.trim() : brief.slice(at + TASK_MARKER.length).trim();
 }
 
+const CLAUDE_DEFAULT_DISALLOWED_TOOLS = [
+  "Bash(sudo *)",
+  "Bash(su *)",
+  "Bash(rm -rf /*)",
+  "Bash(git push --force*)",
+  "Bash(git push *-f *)",
+  "Bash(git reset --hard*)",
+  "Bash(git clean -fdx*)",
+];
+
+const CLAUDE_PLAN_TOOLS = ["Read", "Grep", "Glob"];
+const CLAUDE_EXECUTE_ALLOWED_TOOLS = [
+  "Read",
+  "Grep",
+  "Glob",
+  "Edit",
+  "Write",
+  "Bash(npm test*)",
+  "Bash(npm run *)",
+  "Bash(node --test*)",
+  "Bash(git status*)",
+  "Bash(git diff*)",
+  "Bash(git log*)",
+];
+
 /**
  * Built-in presets.
+
  *
  * `verified` says whether this project has actually round-tripped a real task
  * through that CLI, and doctor reports it. The three originals have; the rest
@@ -102,12 +128,63 @@ const BUILTIN = [
     id: "claude", label: "Claude", owner: "claude-agent", verified: true,
     bin: { envVar: "CLAUDE_BIN", name: "claude", find: findClaude },
     sessionNote: "(session id)",
-    build: ({ prompt, cwd, model, addDirs, autoApprove, resume }) => {
+    build: ({
+      prompt,
+      cwd,
+      model,
+      mode = "plan",
+      permissionMode,
+      allowedTools,
+      disallowedTools,
+      tools,
+      effort,
+      maxBudgetUsd,
+      addDirs,
+      autoApprove = false,
+      resume,
+    }) => {
       const args = [prompt, "--print", "--output-format", "json"];
       if (resume) args.push("--resume", resume);
       if (model) args.push("--model", model);
+      if (effort) args.push("--effort", effort);
+      if (typeof maxBudgetUsd === "number" && maxBudgetUsd > 0) {
+        args.push("--max-budget-usd", String(maxBudgetUsd));
+      }
+
+      const effectiveMode = permissionMode || (mode === "execute" ? "acceptEdits" : "plan");
+      if (effectiveMode === "bypassPermissions") {
+        throw new Error("Refusing permissionMode='bypassPermissions' for Claude backend.");
+      }
+      args.push("--permission-mode", effectiveMode);
+
+      const effectiveTools = tools?.length
+        ? tools
+        : effectiveMode === "plan"
+          ? CLAUDE_PLAN_TOOLS
+          : null;
+      if (effectiveTools?.length) {
+        args.push("--tools", effectiveTools.join(","));
+      }
+
+      const effectiveAllowed = allowedTools?.length
+        ? allowedTools
+        : effectiveMode !== "plan"
+          ? CLAUDE_EXECUTE_ALLOWED_TOOLS
+          : null;
+      if (effectiveAllowed?.length) {
+        args.push("--allowedTools", ...effectiveAllowed);
+      }
+
+      const mergedDisallowed = [...new Set([...CLAUDE_DEFAULT_DISALLOWED_TOOLS, ...(disallowedTools || [])])];
+      if (mergedDisallowed.length) {
+        args.push("--disallowedTools", ...mergedDisallowed);
+      }
+
       for (const d of [cwd, ...(addDirs || [])]) args.push("--add-dir", path.resolve(d));
-      if (autoApprove) args.push("--dangerously-skip-permissions");
+
+      if (autoApprove && process.env.ANTIGRAVITY_ALLOW_UNSAFE_SKIP_PERMISSIONS === "1") {
+        args.push("--dangerously-skip-permissions");
+      }
       return args;
     },
     parse: readClaudeResult,
@@ -346,10 +423,9 @@ export function loadBackends() {
  * the run files and the pid, not from a held child handle.
  */
 export function spawnBackend(spec, id, prompt, opts = {}) {
-  // autoApprove defaults on, matching what the per-backend spawn functions
-  // used to do -- a follow-up passes only cwd and the session id, and
-  // dropping to interactive approval there would just hang the job forever.
-  const args = spec.build({ autoApprove: true, ...opts, prompt });
+  // Default autoApprove=false so backends never bypass permission gates unless
+  // explicitly configured and permitted.
+  const args = spec.build({ autoApprove: false, ...opts, prompt });
   ensureDirs();
   fs.writeFileSync(promptPath(id), prompt);
   const out = fs.openSync(outPath(id), "w");

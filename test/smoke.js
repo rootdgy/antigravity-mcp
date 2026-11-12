@@ -275,7 +275,9 @@ const released = await call(alice, "release_paths", { all_mine: true });
 check("release drops only my locks", released.released === 4);
 check("other agent keeps its lock", (await call(bob, "check_paths", { paths: ["~/proj/ui"] })).paths[0].free);
 
-check("unknown task handled", (await call(alice, "ag_task_status", { task_id: "nope" })).error !== undefined);
+if (lanes.length > 0) {
+  check("unknown task handled", (await call(alice, `${lanes[0]}_task_status`, { task_id: "nope" })).error !== undefined);
+}
 check("reset is guarded", (await call(alice, "coop_reset", {})).error !== undefined);
 check("reset works with confirm", (await call(alice, "coop_reset", { confirm: true })).reset === true);
 

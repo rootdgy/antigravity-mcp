@@ -279,7 +279,7 @@ export function read() {
 const KEEP_FINISHED_TASKS = 40;
 const KEEP_READ_NOTES = 50;
 const NOTE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
-const TERMINAL = ["done", "failed", "cancelled"];
+const TERMINAL = ["done", "completed", "failed", "cancelled", "pushed"];
 
 function prune(board) {
   const finished = board.tasks.filter((t) => TERMINAL.includes(t.status));
